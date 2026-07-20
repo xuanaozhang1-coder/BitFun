@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod prompt_cache;
 pub mod prompt_markup;
 pub mod remote_file_delivery;
+pub mod round_model_route;
 pub mod runtime;
 pub mod scheduled_job;
 pub mod scheduler;

@@ -9,6 +9,9 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use super::Agent;
+use bitfun_agent_runtime::round_model_route::{
+    OneShotRoundModelRoute, ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY,
+};
 use bitfun_agent_runtime::sdk::{
     AgentDialogTurnRequest, AgentRuntime, AgentSessionCreateRequest, AgentSessionDeleteRequest,
     AgentSessionListRequest, AgentSessionRestoreRequest, AgentToolConfirmationRequest,
@@ -55,6 +58,7 @@ pub(crate) struct CoreAgentAdapter {
     session_id: Arc<Mutex<Option<String>>>,
     /// Current turn ID (for cancellation)
     current_turn_id: Arc<Mutex<Option<String>>>,
+    one_shot_round_model_route: Option<OneShotRoundModelRoute>,
 }
 
 impl CoreAgentAdapter {
@@ -67,7 +71,16 @@ impl CoreAgentAdapter {
             workspace_path: Arc::new(RwLock::new(workspace_path)),
             session_id: Arc::new(Mutex::new(None)),
             current_turn_id: Arc::new(Mutex::new(None)),
+            one_shot_round_model_route: None,
         }
+    }
+
+    pub(crate) fn with_one_shot_round_model_route(
+        mut self,
+        route: Option<OneShotRoundModelRoute>,
+    ) -> Self {
+        self.one_shot_round_model_route = route;
+        self
     }
 
     pub(crate) fn event_source(&self) -> &CliAgentEventSource {
@@ -221,6 +234,33 @@ impl CoreAgentAdapter {
 
     pub(crate) fn is_turn_processing(&self, session_id: &str, turn_id: &str) -> bool {
         self.compatibility.is_turn_processing(session_id, turn_id)
+    }
+
+    pub(crate) async fn replay_round_checkpoint(
+        &self,
+        checkpoint_path: &Path,
+        agent_type: &str,
+    ) -> Result<String> {
+        let session_id = self.ensure_session(agent_type).await?;
+        let route = self.one_shot_round_model_route.clone().ok_or_else(|| {
+            anyhow::anyhow!("Round replay requires --eval-small-model and --eval-small-model-round")
+        })?;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut turn_guard = self.current_turn_id.lock().await;
+            *turn_guard = Some(turn_id.clone());
+        }
+        self.compatibility
+            .replay_round_checkpoint(
+                &session_id,
+                &turn_id,
+                &self.workspace_path_buf(),
+                checkpoint_path,
+                route,
+                self.approval_policy == CliApprovalPolicy::Auto,
+            )
+            .await?;
+        Ok(turn_id)
     }
 
     fn build_default_session_name() -> String {
@@ -383,6 +423,12 @@ impl Agent for CoreAgentAdapter {
             metadata.insert(
                 USER_INPUT_AVAILABLE_CONTEXT_KEY.to_string(),
                 serde_json::Value::Bool(false),
+            );
+        }
+        if let Some(route) = &self.one_shot_round_model_route {
+            metadata.insert(
+                ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY.to_string(),
+                serde_json::to_value(route)?,
             );
         }
         let request = AgentDialogTurnRequest {

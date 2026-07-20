@@ -23,6 +23,10 @@ use crate::agentic::image_analysis::{
     ImageLimits,
 };
 use crate::agentic::round_preempt::RoundInjectionKind;
+use crate::agentic::round_replay::{
+    capture_workspace_snapshot, checkpoint_recording_enabled, RoundReplayCheckpoint,
+    ROUND_REPLAY_CHECKPOINT_VERSION, ROUND_REPLAY_START_CONTEXT_KEY,
+};
 use crate::agentic::session::{
     CompressionMode, ContextCompressor, SessionManager, TokenAnchor, TokenAnchorInput,
     UserContextCacheIdentity,
@@ -46,6 +50,9 @@ use crate::util::types::ToolDefinition;
 use crate::util::{elapsed_ms_u64, truncate_at_char_boundary};
 use bitfun_agent_runtime::output_surface::TOOL_CONTEXT_INLINE_MARKDOWN_IMAGE_DISPLAY_KEY;
 use bitfun_agent_runtime::remote_file_delivery::TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY;
+use bitfun_agent_runtime::round_model_route::{
+    OneShotRoundModelRoute, ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY,
+};
 use bitfun_ai_adapters::ModelExchangeTraceConfig;
 use log::{debug, error, info, trace, warn};
 use sha2::{Digest, Sha256};
@@ -2564,6 +2571,23 @@ impl ExecutionEngine {
                 context.turn_index,
             )
             .await?;
+        let one_shot_round_model_route = context
+            .context
+            .get(ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY)
+            .map(|value| OneShotRoundModelRoute::from_context_value(value))
+            .transpose()
+            .map_err(BitFunError::Validation)?;
+        let replay_start_round = context
+            .context
+            .get(ROUND_REPLAY_START_CONTEXT_KEY)
+            .map(|value| {
+                value.parse::<usize>().map_err(|error| {
+                    BitFunError::Validation(format!(
+                        "Invalid round replay start index {value}: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
         info!(
             "Agent using model: agent={}, resolved_model_id={}",
             current_agent.name(),
@@ -2654,6 +2678,8 @@ impl ExecutionEngine {
             Err(_) => true,
         };
         let mut execution_context_vars = context.context.clone();
+        execution_context_vars.remove(ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY);
+        execution_context_vars.remove(ROUND_REPLAY_START_CONTEXT_KEY);
         execution_context_vars.insert(
             "enable_deferred_tool_loading".to_string(),
             deferred_tool_loading_enabled.to_string(),
@@ -2747,12 +2773,20 @@ impl ExecutionEngine {
             })
             .await?;
 
-        // Add System Prompt to the beginning of message list (only for this execution, not persisted)
-        let mut messages = vec![turn_prompt_scaffold.system_prompt_message.clone()];
-        messages.extend(initial_messages);
+        // A replay checkpoint already contains the exact system prompt that was
+        // model-visible at the selected boundary. Normal turns still prepend the
+        // freshly resolved prompt as before.
+        let mut messages = if replay_start_round.is_some() {
+            initial_messages
+        } else {
+            let mut messages = vec![turn_prompt_scaffold.system_prompt_message.clone()];
+            messages.extend(initial_messages);
+            messages
+        };
 
-        let mut round_index = 0;
+        let mut round_index = replay_start_round.unwrap_or(0);
         let mut completed_rounds = 0usize;
+        let mut one_shot_round_model_route_applied = false;
         let mut total_tools = 0;
         let mut last_partial_recovery_reason: Option<String> = None;
         let mut finalization_reason: Option<&'static str> = None;
@@ -2935,7 +2969,10 @@ impl ExecutionEngine {
                 token_pressure.safety_reserve_tokens
             );
 
-            let should_compress = enable_context_compression
+            let is_replay_boundary_round =
+                replay_start_round == Some(round_index) && completed_rounds == 0;
+            let should_compress = !is_replay_boundary_round
+                && enable_context_compression
                 && token_pressure.total_tokens >= token_pressure.input_limit;
             let mut send_pressure_reusable = true;
 
@@ -3057,7 +3094,7 @@ impl ExecutionEngine {
                     send_prepended_reminder_tokens,
                 )
             };
-            if send_pressure.total_tokens > context_window {
+            if !is_replay_boundary_round && send_pressure.total_tokens > context_window {
                 warn!(
                     "Round {} tokens ({}) still exceed context_window ({}) after compression, performing emergency truncation",
                     round_index, send_pressure.total_tokens, context_window
@@ -3099,6 +3136,50 @@ impl ExecutionEngine {
                 "before_send",
             );
 
+            // Replaying a subagent also requires its parent/delegation runtime;
+            // this checkpoint contract intentionally covers top-level CLI turns.
+            if checkpoint_recording_enabled()
+                && replay_start_round.is_none()
+                && context.subagent_parent_info.is_none()
+            {
+                let workspace = context.workspace.as_ref().ok_or_else(|| {
+                    BitFunError::Validation(
+                        "Round checkpoint recording requires a workspace binding".to_string(),
+                    )
+                })?;
+                let workspace_services = context.workspace_services.as_ref().ok_or_else(|| {
+                    BitFunError::Validation(
+                        "Round checkpoint recording requires workspace services".to_string(),
+                    )
+                })?;
+                let workspace_snapshot =
+                    capture_workspace_snapshot(&workspace.root_path_string(), workspace_services)
+                        .await?;
+                let checkpoint = RoundReplayCheckpoint {
+                    version: ROUND_REPLAY_CHECKPOINT_VERSION,
+                    source_session_id: context.session_id.clone(),
+                    source_turn_id: context.dialog_turn_id.clone(),
+                    source_turn_index: context.turn_index,
+                    round_index,
+                    agent_type: agent_type.clone(),
+                    original_user_input: original_user_input.clone(),
+                    primary_model_id: model_id.clone(),
+                    messages: messages.clone(),
+                    workspace: workspace_snapshot,
+                };
+                let checkpoint_path = self
+                    .session_manager
+                    .save_round_replay_checkpoint(&context.session_id, &checkpoint)
+                    .await?;
+                info!(
+                    "Saved round replay checkpoint: session_id={}, turn_id={}, round_index={}, path={}",
+                    context.session_id,
+                    context.dialog_turn_id,
+                    round_index,
+                    checkpoint_path.display()
+                );
+            }
+
             // Create round context
             let mut round_context_vars = execution_context_vars.clone();
             if context.skip_tool_confirmation {
@@ -3111,6 +3192,69 @@ impl ExecutionEngine {
                 .session_manager
                 .persistent_model_exchange_trace_dir(&context.session_id)
                 .await;
+            let routed_model_id = one_shot_round_model_route
+                .as_ref()
+                .and_then(|route| route.model_id_for_round(round_index));
+            let (round_ai_client, round_primary_model_facts, round_context_window) = if let Some(
+                routed_model_id,
+            ) =
+                routed_model_id
+            {
+                let routed_client = ai_client_factory
+                    .get_client_resolved(routed_model_id)
+                    .await
+                    .map_err(|error| {
+                        BitFunError::AIClient(format!(
+                            "Failed to get one-shot round AI client (model_id={}): {}",
+                            routed_model_id, error
+                        ))
+                    })?;
+                let routed_model_facts = Self::resolve_primary_model_context(
+                        routed_model_id,
+                        &routed_client.config.model,
+                        &routed_client.config.format,
+                        "Config service unavailable, assuming routed model is text-only for image input gating",
+                    )
+                    .await;
+                let routed_context_window =
+                    (routed_client.config.context_window as usize).min(session_max_tokens);
+                let routed_trigger_budget = Self::compression_trigger_budget(
+                    routed_context_window,
+                    routed_client.config.max_tokens,
+                );
+                let routed_pressure = Self::estimate_auto_compression_pressure(
+                    &messages,
+                    tool_definitions.as_deref(),
+                    routed_context_window,
+                    routed_trigger_budget,
+                    send_prepended_reminder_tokens,
+                );
+                if routed_pressure.total_tokens >= routed_pressure.input_limit {
+                    return Err(BitFunError::Validation(format!(
+                            "One-shot round model context does not fit without changing the evaluated input: round={}, model_id={}, tokens={}, input_limit={}",
+                            round_index,
+                            routed_model_id,
+                            routed_pressure.total_tokens,
+                            routed_pressure.input_limit
+                        )));
+                }
+                one_shot_round_model_route_applied = true;
+                info!(
+                        "Applying one-shot round model route: session_id={}, turn_id={}, round={}, configured_model_id={}, routed_model_id={}",
+                        context.session_id,
+                        context.dialog_turn_id,
+                        round_index,
+                        model_id,
+                        routed_model_id
+                    );
+                (routed_client, routed_model_facts, routed_context_window)
+            } else {
+                (
+                    ai_client.clone(),
+                    primary_model_facts.clone(),
+                    context_window,
+                )
+            };
             let round_context = RoundContext {
                 session_id: context.session_id.clone(),
                 subagent_parent_info: context.subagent_parent_info.clone(),
@@ -3123,8 +3267,8 @@ impl ExecutionEngine {
                 available_tools: available_tools.clone(),
                 deferred_tools: deferred_tools.clone(),
                 loaded_deferred_tool_specs,
-                model_name: ai_client.config.model.clone(),
-                primary_model_facts: primary_model_facts.clone(),
+                model_name: round_ai_client.config.model.clone(),
+                primary_model_facts: round_primary_model_facts.clone(),
                 agent_type: agent_type.clone(),
                 context_vars: round_context_vars,
                 delegation_policy: context.delegation_policy,
@@ -3152,13 +3296,13 @@ impl ExecutionEngine {
 
             let ai_messages = Self::build_ai_messages_for_send(
                 &messages,
-                &ai_client.config.format,
+                &round_ai_client.config.format,
                 context
                     .workspace
                     .as_ref()
                     .map(|workspace| workspace.root_path()),
                 &context.dialog_turn_id,
-                primary_supports_image_understanding,
+                round_primary_model_facts.supports_image_inputs,
                 &send_prepended_reminders,
             )
             .await?;
@@ -3166,11 +3310,11 @@ impl ExecutionEngine {
             let round_result = self
                 .round_executor
                 .execute_round(
-                    ai_client.clone(),
+                    round_ai_client.clone(),
                     round_context,
                     ai_messages,
                     tool_definitions.clone(),
-                    Some(context_window),
+                    Some(round_context_window),
                 )
                 .await?;
 
@@ -3201,7 +3345,7 @@ impl ExecutionEngine {
                         session_id: context.session_id.clone(),
                         turn_id: context.dialog_turn_id.clone(),
                         round_id,
-                        model_id: ai_client.config.model.clone(),
+                        model_id: round_ai_client.config.model.clone(),
                         input_tokens: usage.prompt_token_count as usize,
                         system_tokens_at_anchor,
                         tool_tokens_at_anchor,
@@ -3610,6 +3754,15 @@ impl ExecutionEngine {
                 round_index - 1,
                 round_index
             );
+        }
+
+        if let Some(route) = one_shot_round_model_route.as_ref() {
+            if !one_shot_round_model_route_applied {
+                return Err(BitFunError::Validation(format!(
+                    "One-shot round model route was not reached: target_round={}, completed_rounds={}",
+                    route.round_number, completed_rounds
+                )));
+            }
         }
 
         // P1-6: Track the actual termination reason for downstream reporting.

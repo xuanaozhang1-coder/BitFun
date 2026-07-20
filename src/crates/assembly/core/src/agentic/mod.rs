@@ -31,6 +31,7 @@ pub mod fork_agent;
 
 /// Round-boundary injection support for steering/background updates
 pub mod round_preempt;
+pub mod round_replay;
 
 // Image analysis module
 pub mod image_analysis;

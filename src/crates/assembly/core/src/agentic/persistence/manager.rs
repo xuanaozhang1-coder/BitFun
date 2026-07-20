@@ -9,6 +9,7 @@ use crate::agentic::core::{
 };
 use crate::agentic::memories::db::{MemoryDatabase, MEMORY_PHASE2_GLOBAL_JOB_KEY};
 use crate::agentic::memories::external_context::dialog_turn_uses_external_context;
+use crate::agentic::round_replay::RoundReplayCheckpoint;
 use crate::agentic::session::transcript_render::{render_transcript, transcript_fingerprint};
 use crate::agentic::session::{
     CoreSessionStorePort, SessionPromptCache, TokenAnchor, PROMPT_CACHE_SCHEMA_VERSION,
@@ -1118,6 +1119,29 @@ impl PersistenceManager {
             ))
             .await?;
         Ok(snapshot.map(|value| value.messages))
+    }
+
+    pub async fn save_round_replay_checkpoint(
+        &self,
+        workspace_path: &Path,
+        checkpoint: &RoundReplayCheckpoint,
+    ) -> BitFunResult<PathBuf> {
+        Self::validate_session_id(&checkpoint.source_session_id)?;
+        self.ensure_runtime_for_write(workspace_path).await?;
+        let session_dir = self
+            .ensure_session_dir(workspace_path, &checkpoint.source_session_id)
+            .await?;
+        let checkpoint_dir = session_dir
+            .join("round-checkpoints")
+            .join(format!("turn-{:04}", checkpoint.source_turn_index));
+        fs::create_dir_all(&checkpoint_dir).await.map_err(|error| {
+            BitFunError::io(format!(
+                "Failed to create round checkpoint directory: {error}"
+            ))
+        })?;
+        let path = checkpoint_dir.join(format!("round-{:04}.json", checkpoint.round_index));
+        self.write_json_atomic(&path, checkpoint).await?;
+        Ok(path)
     }
 
     pub async fn load_latest_turn_context_snapshot(

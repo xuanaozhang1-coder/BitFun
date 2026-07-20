@@ -31,6 +31,10 @@ use crate::agentic::goal_mode::{
 use crate::agentic::image_analysis::ImageContextData;
 use crate::agentic::memories::{start_memory_startup_task, MemoryStartupRequest};
 use crate::agentic::round_preempt::DialogRoundInjectionSource;
+use crate::agentic::round_replay::{
+    restore_workspace_snapshot, RoundReplayCheckpoint, ROUND_REPLAY_METADATA_KEY,
+    ROUND_REPLAY_START_CONTEXT_KEY,
+};
 use crate::agentic::session::session_store_port::CoreSessionStorePort;
 use crate::agentic::session::SessionManager;
 use crate::agentic::side_question::build_btw_user_input;
@@ -62,6 +66,9 @@ use bitfun_agent_runtime::output_surface::{
 use bitfun_agent_runtime::remote_file_delivery::{
     needs_computer_links_for_source, remote_file_delivery_reminder,
     TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY,
+};
+use bitfun_agent_runtime::round_model_route::{
+    OneShotRoundModelRoute, ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY,
 };
 use bitfun_agent_runtime::user_questions::USER_INPUT_AVAILABLE_CONTEXT_KEY;
 use bitfun_runtime_ports::{
@@ -2355,6 +2362,79 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         .await
     }
 
+    pub async fn start_dialog_turn_from_round_checkpoint(
+        &self,
+        session_id: String,
+        turn_id: String,
+        checkpoint: RoundReplayCheckpoint,
+        route: OneShotRoundModelRoute,
+        workspace_path: String,
+        submission_policy: DialogSubmissionPolicy,
+    ) -> BitFunResult<()> {
+        checkpoint.validate()?;
+        if route.round_number != checkpoint.round_index {
+            return Err(BitFunError::Validation(format!(
+                "Round replay checkpoint targets round {}, but the one-shot route targets round {}",
+                checkpoint.round_index, route.round_number
+            )));
+        }
+
+        let session = self
+            .session_manager
+            .get_session(&session_id)
+            .ok_or_else(|| BitFunError::NotFound(format!("Session not found: {session_id}")))?;
+        let workspace = Self::build_workspace_binding(&session.config)
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(
+                    "Round replay requires a workspace binding for the target session".to_string(),
+                )
+            })?;
+        let workspace_services = Self::build_workspace_services(&Some(workspace.clone()))
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(
+                    "Round replay requires workspace services for the target session".to_string(),
+                )
+            })?;
+        restore_workspace_snapshot(
+            &workspace.root_path_string(),
+            &workspace_services,
+            &checkpoint.workspace,
+        )
+        .await?;
+        self.session_manager
+            .replace_context_messages(&session_id, checkpoint.messages.clone())
+            .await;
+
+        let metadata = serde_json::json!({
+            ROUND_REPLAY_METADATA_KEY: {
+                "source_session_id": checkpoint.source_session_id.clone(),
+                "source_turn_id": checkpoint.source_turn_id.clone(),
+                "source_turn_index": checkpoint.source_turn_index,
+                "round_index": checkpoint.round_index,
+            },
+            ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY: route,
+            USER_INPUT_AVAILABLE_CONTEXT_KEY: false,
+        });
+        self.start_dialog_turn_internal(
+            session_id,
+            checkpoint.original_user_input.clone(),
+            Some(checkpoint.original_user_input),
+            None,
+            Some(turn_id),
+            checkpoint.agent_type,
+            Some(workspace_path),
+            None,
+            None,
+            submission_policy,
+            Some(metadata),
+            Vec::new(),
+            true,
+        )
+        .await
+    }
+
     fn thread_goal_store(&self) -> ThreadGoalStore<'_> {
         ThreadGoalStore::new(self.session_manager.as_ref())
     }
@@ -3353,6 +3433,21 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 .is_some_and(|images| !images.is_empty());
 
         let mut user_message_metadata = extra_user_message_metadata;
+        let one_shot_round_model_route =
+            OneShotRoundModelRoute::from_metadata(user_message_metadata.as_ref())
+                .map_err(BitFunError::Validation)?;
+        let round_replay_start = user_message_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(ROUND_REPLAY_METADATA_KEY))
+            .and_then(|metadata| metadata.get("round_index"))
+            .map(|value| {
+                value.as_u64().map(|value| value as usize).ok_or_else(|| {
+                    BitFunError::Validation(
+                        "Round replay metadata has an invalid round_index".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
 
         // Build image metadata for workspace turn persistence (before image_contexts is consumed)
         // Also stores original_text so the UI can display the user's actual input
@@ -3425,28 +3520,41 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             skill_agent_context_vars.insert("acp_transport".to_string(), "true".to_string());
         }
 
-        let wrapped_user_input_payload = self
-            .wrap_user_input(
-                &session_id,
-                turn_index,
-                &effective_agent_type,
-                previous_agent_type
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty()),
-                user_input,
-                session_workspace.as_ref(),
-                workspace_services.as_ref(),
-                session.config.enable_tools,
-                &skill_agent_context_vars,
+        let wrapped_user_input_payload = if round_replay_start.is_some() {
+            None
+        } else {
+            Some(
+                self.wrap_user_input(
+                    &session_id,
+                    turn_index,
+                    &effective_agent_type,
+                    previous_agent_type
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    user_input,
+                    session_workspace.as_ref(),
+                    workspace_services.as_ref(),
+                    session.config.enable_tools,
+                    &skill_agent_context_vars,
+                )
+                .await?,
             )
-            .await?;
-        let effective_user_input = wrapped_user_input_payload.content.clone();
-        let prepended_messages = merge_prepended_messages_for_turn(
-            additional_prepended_messages,
-            wrapped_user_input_payload.prepended_messages.clone(),
-            needs_computer_links_for_source(submission_policy.trigger_source),
-        );
+        };
+        let effective_user_input = wrapped_user_input_payload
+            .as_ref()
+            .map(|payload| payload.content.clone())
+            .unwrap_or_else(|| original_user_input.clone());
+        let prepended_messages = wrapped_user_input_payload
+            .as_ref()
+            .map(|payload| {
+                merge_prepended_messages_for_turn(
+                    additional_prepended_messages.clone(),
+                    payload.prepended_messages.clone(),
+                    needs_computer_links_for_source(submission_policy.trigger_source),
+                )
+            })
+            .unwrap_or_default();
 
         if original_user_input != effective_user_input {
             let mut metadata =
@@ -3462,18 +3570,29 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
 
         // Start new dialog turn (sets state to Processing internally)
         // Pass frontend turnId, generate if not provided
-        let turn_id = self
-            .session_manager
-            .start_dialog_turn_with_prepended_messages(
-                &session_id,
-                effective_agent_type.clone(),
-                effective_user_input.clone(),
-                turn_id,
-                image_contexts,
-                prepended_messages,
-                user_message_metadata.clone(),
-            )
-            .await?;
+        let turn_id = if round_replay_start.is_some() {
+            self.session_manager
+                .start_dialog_turn_with_existing_context(
+                    &session_id,
+                    effective_agent_type.clone(),
+                    effective_user_input.clone(),
+                    turn_id,
+                    user_message_metadata.clone(),
+                )
+                .await?
+        } else {
+            self.session_manager
+                .start_dialog_turn_with_prepended_messages(
+                    &session_id,
+                    effective_agent_type.clone(),
+                    effective_user_input.clone(),
+                    turn_id,
+                    image_contexts,
+                    prepended_messages,
+                    user_message_metadata.clone(),
+                )
+                .await?
+        };
         start_memory_startup_task(MemoryStartupRequest {
             session_id: session_id.clone(),
             session_kind: session.kind,
@@ -3496,27 +3615,29 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                     .mark_turn_started(&turn_id, Some(&goal));
             }
         }
-        match wrapped_user_input_payload.snapshot_persistence {
-            SkillAgentSnapshotPersistence::None => {}
-            SkillAgentSnapshotPersistence::SaveCurrentTurn => {
-                self.session_manager
-                    .remember_turn_skill_agent_snapshot(
-                        &session_id,
-                        turn_index,
-                        wrapped_user_input_payload.skill_agent_snapshot.clone(),
-                    )
-                    .await;
-            }
-            SkillAgentSnapshotPersistence::RecoverFirstTurnBaseline => {
-                self.session_manager
-                    .recover_first_turn_skill_agent_snapshot(
-                        &session_id,
-                        wrapped_user_input_payload.skill_agent_snapshot.clone(),
-                    )
-                    .await;
-                self.session_manager
-                    .remove_listing_diff_internal_reminders(&session_id)
-                    .await;
+        if let Some(wrapped_user_input_payload) = wrapped_user_input_payload {
+            match wrapped_user_input_payload.snapshot_persistence {
+                SkillAgentSnapshotPersistence::None => {}
+                SkillAgentSnapshotPersistence::SaveCurrentTurn => {
+                    self.session_manager
+                        .remember_turn_skill_agent_snapshot(
+                            &session_id,
+                            turn_index,
+                            wrapped_user_input_payload.skill_agent_snapshot.clone(),
+                        )
+                        .await;
+                }
+                SkillAgentSnapshotPersistence::RecoverFirstTurnBaseline => {
+                    self.session_manager
+                        .recover_first_turn_skill_agent_snapshot(
+                            &session_id,
+                            wrapped_user_input_payload.skill_agent_snapshot.clone(),
+                        )
+                        .await;
+                    self.session_manager
+                        .remove_listing_diff_internal_reminders(&session_id)
+                        .await;
+                }
             }
         }
 
@@ -3605,6 +3726,18 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
 
         // Pass turn_index (for operation history/rollback)
         context_vars.insert("turn_index".to_string(), turn_index.to_string());
+        if let Some(route) = one_shot_round_model_route {
+            context_vars.insert(
+                ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY.to_string(),
+                route.to_context_value().map_err(BitFunError::Validation)?,
+            );
+        }
+        if let Some(round_index) = round_replay_start {
+            context_vars.insert(
+                ROUND_REPLAY_START_CONTEXT_KEY.to_string(),
+                round_index.to_string(),
+            );
+        }
         let review_agent = is_review_agent_type(&effective_agent_type);
         let turn_review_manifest =
             turn_review_manifest_for_agent(user_message_metadata.as_ref(), &effective_agent_type);

@@ -9,9 +9,13 @@ mod runtime_services;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bitfun_agent_runtime::round_model_route::OneShotRoundModelRoute;
 use bitfun_agent_runtime::sdk::AgentRuntime;
 use bitfun_harness::HarnessRegistry;
-use bitfun_runtime_ports::{SessionStoragePathRequest, SessionStorePort, SessionViewRestoreTiming};
+use bitfun_runtime_ports::{
+    AgentSubmissionSource, DialogSubmissionPolicy, SessionStoragePathRequest, SessionStorePort,
+    SessionViewRestoreTiming,
+};
 use bitfun_runtime_services::RuntimeServices;
 
 use crate::agentic::coordination::{
@@ -21,6 +25,7 @@ use crate::agentic::core::{Session, SessionConfig, SessionState};
 use crate::agentic::keyed_lock::KeyedAsyncLockGuard;
 use crate::agentic::persistence::session_branch::{SessionBranchRequest, SessionBranchResult};
 use crate::agentic::persistence::{PersistenceManager, SessionMetadataPage};
+use crate::agentic::round_replay::RoundReplayCheckpoint;
 use crate::agentic::session::CoreSessionStorePort;
 use crate::service::session::{DialogTurnData, SessionMetadata};
 use crate::service::session_usage::{
@@ -256,6 +261,37 @@ impl CoreAgentRuntimeCompatibility {
     pub async fn update_session_model(&self, session_id: &str, model_id: &str) -> BitFunResult<()> {
         self.coordinator
             .update_session_model(session_id, model_id)
+            .await
+    }
+
+    pub async fn replay_round_checkpoint(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        workspace_path: &Path,
+        checkpoint_path: &Path,
+        route: OneShotRoundModelRoute,
+        skip_tool_confirmation: bool,
+    ) -> BitFunResult<()> {
+        let checkpoint = RoundReplayCheckpoint::load(checkpoint_path).await?;
+        if route.round_number != checkpoint.round_index {
+            return Err(BitFunError::Validation(format!(
+                "Checkpoint round {} does not match requested small-model round {}",
+                checkpoint.round_index, route.round_number
+            )));
+        }
+        self.update_session_model(session_id, &checkpoint.primary_model_id)
+            .await?;
+        self.coordinator
+            .start_dialog_turn_from_round_checkpoint(
+                session_id.to_string(),
+                turn_id.to_string(),
+                checkpoint,
+                route,
+                workspace_path.to_string_lossy().to_string(),
+                DialogSubmissionPolicy::for_source(AgentSubmissionSource::Cli)
+                    .with_skip_tool_confirmation(skip_tool_confirmation),
+            )
             .await
     }
 

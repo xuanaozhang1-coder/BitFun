@@ -27,6 +27,7 @@ mod ui;
 use anyhow::{anyhow, Result};
 use bitfun_core::service::remote_connect::DeviceIdentity;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
@@ -114,6 +115,18 @@ enum Commands {
         /// Fork the resumed session before executing the prompt
         #[arg(long = "fork-session")]
         fork_session: bool,
+
+        /// Evaluation-only model override for exactly one zero-based model round
+        #[arg(long, hide = true, requires = "eval_small_model_round")]
+        eval_small_model: Option<String>,
+
+        /// Zero-based model round that uses --eval-small-model
+        #[arg(long, hide = true, requires = "eval_small_model")]
+        eval_small_model_round: Option<usize>,
+
+        /// Evaluation-only checkpoint used to resume at a recorded model round
+        #[arg(long, hide = true)]
+        eval_replay_checkpoint: Option<PathBuf>,
 
         /// Output format for automation
         #[arg(long, value_enum, default_value_t = ExecOutputFormat::Text)]
@@ -718,6 +731,9 @@ async fn run_cli() -> Result<()> {
             session,
             session_id,
             fork_session,
+            eval_small_model,
+            eval_small_model_round,
+            eval_replay_checkpoint,
             output_format,
             output_patch,
             auto,
@@ -743,6 +759,9 @@ async fn run_cli() -> Result<()> {
                     session,
                     session_id,
                     fork_session,
+                    eval_small_model,
+                    eval_small_model_round,
+                    eval_replay_checkpoint,
                     output_format,
                     output_patch,
                     approval_mode,
@@ -1158,5 +1177,75 @@ mod bootstrap_profile_tests {
         .map(std::ffi::OsString::from);
 
         assert!(exec_requests_json_output(&args));
+    }
+}
+
+#[cfg(test)]
+mod eval_round_route_cli_tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn exec_parses_one_shot_round_model_route() {
+        let cli = Cli::try_parse_from([
+            "bitfun-cli",
+            "exec",
+            "task",
+            "--eval-small-model",
+            "small-model",
+            "--eval-small-model-round",
+            "4",
+        ])
+        .expect("parse evaluation route");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Exec {
+                eval_small_model: Some(model_id),
+                eval_small_model_round: Some(4),
+                ..
+            }) if model_id == "small-model"
+        ));
+    }
+
+    #[test]
+    fn exec_requires_both_one_shot_route_arguments() {
+        let result = Cli::try_parse_from([
+            "bitfun-cli",
+            "exec",
+            "task",
+            "--eval-small-model",
+            "small-model",
+        ]);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("round argument is required"),
+        };
+
+        assert!(error.to_string().contains("--eval-small-model-round"));
+    }
+
+    #[test]
+    fn exec_parses_round_replay_checkpoint() {
+        let cli = Cli::try_parse_from([
+            "bitfun-cli",
+            "exec",
+            "task",
+            "--eval-small-model",
+            "small-model",
+            "--eval-small-model-round",
+            "2",
+            "--eval-replay-checkpoint",
+            "/logs/agent/bitfun/sessions/source/round-checkpoints/turn-0000/round-0002.json",
+        ])
+        .expect("parse round replay checkpoint");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Exec {
+                eval_replay_checkpoint: Some(path),
+                ..
+            }) if path.ends_with("round-0002.json")
+        ));
     }
 }

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bitfun_agent_runtime::round_model_route::OneShotRoundModelRoute;
 use bitfun_agent_tools::effective_tool_invocation;
 use bitfun_events::{AgenticEvent, ToolEventIdentity};
 use tokio::time::{sleep, Instant};
@@ -316,6 +317,7 @@ pub(crate) struct ExecMode {
     output_format: ExecOutputFormat,
     approval_mode: ExecApprovalMode,
     session_options: ExecSessionOptions,
+    round_replay_checkpoint: Option<PathBuf>,
 }
 
 impl ExecMode {
@@ -328,16 +330,18 @@ impl ExecMode {
         output_patch: Option<String>,
         output_format: ExecOutputFormat,
         session_options: ExecSessionOptions,
+        one_shot_round_model_route: Option<OneShotRoundModelRoute>,
+        round_replay_checkpoint: Option<PathBuf>,
     ) -> Self {
         let approval_mode = match runtime.approval_policy() {
             crate::runtime::approval::CliApprovalPolicy::Auto => ExecApprovalMode::Auto,
             crate::runtime::approval::CliApprovalPolicy::Ask
             | crate::runtime::approval::CliApprovalPolicy::Reject => ExecApprovalMode::Reject,
         };
-        let agent = Arc::new(CoreAgentAdapter::new(
-            runtime.as_ref(),
-            workspace_path.clone(),
-        ));
+        let agent = Arc::new(
+            CoreAgentAdapter::new(runtime.as_ref(), workspace_path.clone())
+                .with_one_shot_round_model_route(one_shot_round_model_route),
+        );
 
         Self {
             config,
@@ -350,6 +354,7 @@ impl ExecMode {
             output_format,
             approval_mode,
             session_options,
+            round_replay_checkpoint,
         }
     }
 
@@ -565,11 +570,16 @@ impl ExecMode {
             eprintln!("Thinking...");
         });
 
-        let turn_id = match self
-            .agent
-            .send_message(self.message.clone(), &self.agent_type)
-            .await
-        {
+        let turn_start = if let Some(checkpoint_path) = self.round_replay_checkpoint.as_deref() {
+            self.agent
+                .replay_round_checkpoint(checkpoint_path, &self.agent_type)
+                .await
+        } else {
+            self.agent
+                .send_message(self.message.clone(), &self.agent_type)
+                .await
+        };
+        let turn_id = match turn_start {
             Ok(turn_id) => turn_id,
             Err(error) => {
                 emit_exit_diagnostic(

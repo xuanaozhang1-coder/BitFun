@@ -5506,6 +5506,22 @@ impl SessionManager {
             .await;
     }
 
+    pub async fn save_round_replay_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint: &crate::agentic::round_replay::RoundReplayCheckpoint,
+    ) -> BitFunResult<std::path::PathBuf> {
+        let workspace_path = self
+            .effective_session_storage_path(session_id)
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(format!("Session workspace_path is missing: {session_id}"))
+            })?;
+        self.persistence_manager
+            .save_round_replay_checkpoint(&workspace_path, checkpoint)
+            .await
+    }
+
     pub fn set_file_read_state(&self, session_id: &str, logical_path: &str, state: FileReadState) {
         self.file_read_state_store
             .set(session_id, logical_path, state);

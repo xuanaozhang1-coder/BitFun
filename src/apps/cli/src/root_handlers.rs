@@ -3,7 +3,12 @@ use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
 
+use bitfun_agent_runtime::round_model_route::{
+    OneShotRoundModelRoute, ONE_SHOT_ROUND_MODEL_ROUTE_MODEL_ENV,
+    ONE_SHOT_ROUND_MODEL_ROUTE_ROUND_ENV,
+};
 use bitfun_agent_runtime::sdk::{AgentSessionRestoreRequest, SessionTranscriptRequest};
+use bitfun_core::agentic::round_replay::ROUND_REPLAY_CHECKPOINT_ENV;
 
 use crate::{
     chat_state::{transcript_message_preview, transcript_role_label},
@@ -27,6 +32,9 @@ pub(crate) struct ExecCommandArgs {
     pub output_format: ExecOutputFormat,
     pub output_patch: Option<String>,
     pub approval_mode: ExecApprovalMode,
+    pub eval_small_model: Option<String>,
+    pub eval_small_model_round: Option<usize>,
+    pub eval_replay_checkpoint: Option<std::path::PathBuf>,
 }
 
 pub(crate) async fn handle_exec_command(config: CliConfig, args: ExecCommandArgs) -> Result<()> {
@@ -90,6 +98,61 @@ pub(crate) async fn handle_exec_command(config: CliConfig, args: ExecCommandArgs
             ),
         );
     }
+    let one_shot_round_model_route = match (
+        args.eval_small_model_round,
+        args.eval_small_model.as_deref(),
+    ) {
+        (Some(round_number), Some(model_id)) => {
+            match OneShotRoundModelRoute::new(round_number, model_id) {
+                Ok(route) => Some(route),
+                Err(error) => {
+                    return exec_preflight_error(args.output_format, anyhow::anyhow!(error));
+                }
+            }
+        }
+        (None, None) => {
+            let env_model = std::env::var(ONE_SHOT_ROUND_MODEL_ROUTE_MODEL_ENV).ok();
+            let env_round = std::env::var(ONE_SHOT_ROUND_MODEL_ROUTE_ROUND_ENV).ok();
+            match OneShotRoundModelRoute::from_env_values(
+                env_model.as_deref(),
+                env_round.as_deref(),
+            ) {
+                Ok(route) => route,
+                Err(error) => {
+                    return exec_preflight_error(args.output_format, anyhow::anyhow!(error));
+                }
+            }
+        }
+        _ => {
+            return exec_preflight_error(
+                args.output_format,
+                anyhow::anyhow!(
+                    "--eval-small-model and --eval-small-model-round must be provided together"
+                ),
+            );
+        }
+    };
+    let round_replay_checkpoint = args
+        .eval_replay_checkpoint
+        .or_else(|| std::env::var_os(ROUND_REPLAY_CHECKPOINT_ENV).map(std::path::PathBuf::from));
+    if round_replay_checkpoint.is_some() && one_shot_round_model_route.is_none() {
+        return exec_preflight_error(
+            args.output_format,
+            anyhow::anyhow!(
+                "Round replay requires --eval-small-model and --eval-small-model-round (or their BITFUN_EVAL_* environment variables)"
+            ),
+        );
+    }
+    if round_replay_checkpoint.is_some()
+        && (args.continue_last || resume.is_some() || args.fork_session)
+    {
+        return exec_preflight_error(
+            args.output_format,
+            anyhow::anyhow!(
+                "Round replay creates a new evaluation session and cannot be combined with --continue, --resume, --session, or --fork-session"
+            ),
+        );
+    }
 
     let approval_policy = match args.approval_mode {
         ExecApprovalMode::Reject => crate::runtime::approval::CliApprovalPolicy::Reject,
@@ -133,6 +196,8 @@ pub(crate) async fn handle_exec_command(config: CliConfig, args: ExecCommandArgs
             session_id: args.session_id,
             fork_session: args.fork_session,
         },
+        one_shot_round_model_route,
+        round_replay_checkpoint,
     );
     let run_result = exec_mode.run().await;
 
