@@ -676,6 +676,7 @@ impl RoundExecutor {
                 Message::assistant_with_reasoning(reasoning, clean_text, vec![])
                     .with_turn_id(context.dialog_turn_id.clone())
                     .with_round_id(round_id.clone())
+                    .with_round_metadata(context.round_number, context.model_name.clone())
                     .with_thinking_signature(stream_result.thinking_signature.clone())
                     .with_memory_citation(parsed_memory_citation);
 
@@ -922,6 +923,7 @@ impl RoundExecutor {
             Message::assistant_with_reasoning(reasoning, clean_text, tool_calls.clone())
                 .with_turn_id(context.dialog_turn_id.clone())
                 .with_round_id(round_id.clone())
+                .with_round_metadata(context.round_number, context.model_name.clone())
                 .with_thinking_signature(stream_result.thinking_signature.clone())
                 .with_memory_citation(parsed_memory_citation);
 
@@ -944,6 +946,7 @@ impl RoundExecutor {
                 Message::tool_result(result.clone())
                     .with_turn_id(dialog_turn_id.clone())
                     .with_round_id(round_id_clone.clone())
+                    .with_round_metadata(context.round_number, context.model_name.clone())
             })
             .collect();
 

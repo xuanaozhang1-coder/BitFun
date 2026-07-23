@@ -25,7 +25,8 @@ use crate::agentic::image_analysis::{
 use crate::agentic::round_preempt::RoundInjectionKind;
 use crate::agentic::round_replay::{
     capture_workspace_snapshot, checkpoint_recording_enabled, RoundReplayCheckpoint,
-    ROUND_REPLAY_CHECKPOINT_VERSION, ROUND_REPLAY_START_CONTEXT_KEY,
+    ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY, ROUND_REPLAY_CHECKPOINT_VERSION,
+    ROUND_REPLAY_START_CONTEXT_KEY,
 };
 use crate::agentic::session::{
     CompressionMode, ContextCompressor, SessionManager, TokenAnchor, TokenAnchorInput,
@@ -2680,6 +2681,7 @@ impl ExecutionEngine {
         let mut execution_context_vars = context.context.clone();
         execution_context_vars.remove(ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY);
         execution_context_vars.remove(ROUND_REPLAY_START_CONTEXT_KEY);
+        execution_context_vars.remove(ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY);
         execution_context_vars.insert(
             "enable_deferred_tool_loading".to_string(),
             deferred_tool_loading_enabled.to_string(),
@@ -2803,8 +2805,12 @@ impl ExecutionEngine {
         let mut full_compression_count = 0usize;
         let mut compression_failure_count = 0u32;
 
-        // Save the last token usage statistics
-        let mut last_usage: Option<crate::util::types::ai::GeminiUsage> = None;
+        let mut total_prompt_tokens = 0u64;
+        let mut total_completion_tokens = 0u64;
+        let mut total_reported_tokens = 0u64;
+        let mut total_cached_tokens = 0u64;
+        let mut usage_report_count = 0usize;
+        let mut cached_usage_report_count = 0usize;
 
         // Track thinking-only rescue reminders for observability. This counter
         // is not a stop condition.
@@ -3138,10 +3144,7 @@ impl ExecutionEngine {
 
             // Replaying a subagent also requires its parent/delegation runtime;
             // this checkpoint contract intentionally covers top-level CLI turns.
-            if checkpoint_recording_enabled()
-                && replay_start_round.is_none()
-                && context.subagent_parent_info.is_none()
-            {
+            if checkpoint_recording_enabled() && context.subagent_parent_info.is_none() {
                 let workspace = context.workspace.as_ref().ok_or_else(|| {
                     BitFunError::Validation(
                         "Round checkpoint recording requires a workspace binding".to_string(),
@@ -3155,17 +3158,33 @@ impl ExecutionEngine {
                 let workspace_snapshot =
                     capture_workspace_snapshot(&workspace.root_path_string(), workspace_services)
                         .await?;
+                let artifact_session_id = context
+                    .context
+                    .get(ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY)
+                    .map(String::as_str)
+                    .unwrap_or(&context.session_id);
+                let session_artifacts = self
+                    .session_manager
+                    .capture_round_replay_session_artifacts(
+                        &context.session_id,
+                        artifact_session_id,
+                    )
+                    .await?;
                 let checkpoint = RoundReplayCheckpoint {
                     version: ROUND_REPLAY_CHECKPOINT_VERSION,
                     source_session_id: context.session_id.clone(),
                     source_turn_id: context.dialog_turn_id.clone(),
                     source_turn_index: context.turn_index,
                     round_index,
+                    artifact_session_id: (artifact_session_id != context.session_id)
+                        .then(|| artifact_session_id.to_string()),
                     agent_type: agent_type.clone(),
                     original_user_input: original_user_input.clone(),
                     primary_model_id: model_id.clone(),
+                    session_max_context_tokens: Some(session_max_tokens),
                     messages: messages.clone(),
                     workspace: workspace_snapshot,
+                    session_artifacts,
                 };
                 let checkpoint_path = self
                     .session_manager
@@ -3326,9 +3345,15 @@ impl ExecutionEngine {
             );
             completed_rounds += 1;
 
-            // Save the last token usage statistics (update each time, keep the last one)
             if let Some(ref usage) = round_result.usage {
-                last_usage = Some(usage.clone());
+                total_prompt_tokens += u64::from(usage.prompt_token_count);
+                total_completion_tokens += u64::from(usage.candidates_token_count);
+                total_reported_tokens += u64::from(usage.total_token_count);
+                usage_report_count += 1;
+                if let Some(cached_tokens) = usage.cached_content_token_count {
+                    total_cached_tokens += u64::from(cached_tokens);
+                    cached_usage_report_count += 1;
+                }
                 let round_id = round_result
                     .assistant_message
                     .metadata
@@ -3886,7 +3911,14 @@ impl ExecutionEngine {
                     }
                     completed_rounds += 1;
                     if let Some(usage) = chosen_usage {
-                        last_usage = Some(usage);
+                        total_prompt_tokens += u64::from(usage.prompt_token_count);
+                        total_completion_tokens += u64::from(usage.candidates_token_count);
+                        total_reported_tokens += u64::from(usage.total_token_count);
+                        usage_report_count += 1;
+                        if let Some(cached_tokens) = usage.cached_content_token_count {
+                            total_cached_tokens += u64::from(cached_tokens);
+                            cached_usage_report_count += 1;
+                        }
                     }
                     messages.push(msg.clone());
                     if let Err(e) = self
@@ -3963,17 +3995,27 @@ impl ExecutionEngine {
             debug!("DialogTurnCompleted event sent");
         }
 
-        // Print dialog turn token statistics (from model's last returned usage)
-        if let Some(usage) = last_usage {
+        // Print aggregate dialog-turn token statistics across every model call.
+        if usage_report_count > 0 {
+            let cache_coverage = if cached_usage_report_count == usage_report_count {
+                "true"
+            } else if cached_usage_report_count > 0 {
+                "partial"
+            } else {
+                "false"
+            };
             info!(
-                "Dialog turn completed - Token stats: turn_id={}, rounds={}, tools={}, duration={}ms, prompt_tokens={}, completion_tokens={}, total_tokens={}",
+                "Dialog turn completed - Token stats: turn_id={}, rounds={}, model_calls={}, tools={}, duration={}ms, prompt_tokens={}, completion_tokens={}, total_tokens={}, cached_tokens={}, cached_tokens_available={}",
                 context.dialog_turn_id,
                 completed_rounds,
+                usage_report_count,
                 total_tools,
                 duration_ms,
-                usage.prompt_token_count,
-                usage.candidates_token_count,
-                usage.total_token_count
+                total_prompt_tokens,
+                total_completion_tokens,
+                total_reported_tokens,
+                total_cached_tokens,
+                cache_coverage,
             );
         } else {
             warn!("Dialog turn completed but token stats not available");

@@ -58,6 +58,10 @@ pub enum MessageContent {
 pub struct MessageMetadata {
     pub turn_id: Option<String>,
     pub round_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     pub tokens: Option<usize>,
     /// Anthropic extended thinking signature (for passing back in multi-turn conversations)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -526,6 +530,12 @@ impl Message {
     /// Set message's round_id (to identify which model round the message belongs to)
     pub fn with_round_id(mut self, round_id: String) -> Self {
         self.metadata.round_id = Some(round_id);
+        self
+    }
+
+    pub fn with_round_metadata(mut self, round_index: usize, model_id: String) -> Self {
+        self.metadata.round_index = Some(round_index);
+        self.metadata.model_id = Some(model_id);
         self
     }
 

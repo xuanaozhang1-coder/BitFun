@@ -11,6 +11,9 @@ use crate::agentic::image_analysis::ImageContextData;
 use crate::agentic::keyed_lock::{KeyedAsyncLock, KeyedAsyncLockGuard};
 use crate::agentic::memories::db::{MemoryDatabase, MEMORY_PHASE2_GLOBAL_JOB_KEY};
 use crate::agentic::persistence::PersistenceManager;
+use crate::agentic::round_replay::{
+    capture_session_artifacts, restore_session_artifacts, RoundSessionArtifact,
+};
 use crate::agentic::session::session_store_port::CoreSessionStorePort;
 use crate::agentic::session::{
     prompt_cache_persist_action, reconcile_prompt_cache_restore, CachedSystemPrompt,
@@ -817,6 +820,74 @@ impl SessionManager {
             })?;
 
         Some(SessionStorageLayout::new(storage_path).request_traces_dir(session_id))
+    }
+
+    pub async fn capture_round_replay_session_artifacts(
+        &self,
+        session_id: &str,
+        artifact_session_id: &str,
+    ) -> BitFunResult<Vec<RoundSessionArtifact>> {
+        let storage_path = self
+            .effective_session_storage_path(session_id)
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(format!(
+                    "Session storage path is unavailable: {session_id}"
+                ))
+            })?;
+        let session_dir = SessionStorageLayout::new(storage_path).session_dir(artifact_session_id);
+        capture_session_artifacts(&session_dir).await
+    }
+
+    pub async fn restore_round_replay_session_artifacts(
+        &self,
+        target_session_id: &str,
+        source_session_id: &str,
+        artifacts: &[RoundSessionArtifact],
+    ) -> BitFunResult<()> {
+        if artifacts.is_empty() {
+            return Ok(());
+        }
+        let storage_path = self
+            .effective_session_storage_path(target_session_id)
+            .await
+            .ok_or_else(|| {
+                BitFunError::Validation(format!(
+                    "Session storage path is unavailable: {target_session_id}"
+                ))
+            })?;
+        let session_dir = SessionStorageLayout::new(storage_path).session_dir(source_session_id);
+        restore_session_artifacts(&session_dir, artifacts).await
+    }
+
+    pub async fn set_session_max_context_tokens(
+        &self,
+        session_id: &str,
+        max_context_tokens: usize,
+    ) -> BitFunResult<()> {
+        if max_context_tokens == 0 {
+            return Err(BitFunError::Validation(
+                "Round replay max_context_tokens must be greater than zero".to_string(),
+            ));
+        }
+        let session_snapshot = if let Some(mut session) = self.sessions.get_mut(session_id) {
+            session.config.max_context_tokens = max_context_tokens;
+            session.updated_at = SystemTime::now();
+            session.last_activity_at = SystemTime::now();
+            session.clone()
+        } else {
+            return Err(BitFunError::NotFound(format!(
+                "Session not found: {session_id}"
+            )));
+        };
+        if self.should_persist_session_id(session_id) {
+            if let Some(storage_path) = self.effective_session_storage_path(session_id).await {
+                self.persistence_manager
+                    .save_session(&storage_path, &session_snapshot)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn resolve_session_workspace_binding(
@@ -4850,8 +4921,12 @@ impl SessionManager {
         for msg in messages {
             match msg.role {
                 MessageRole::Assistant => {
-                    let round_index = rounds.len();
-                    let round_id = format!("{}-round-{}", turn_id, round_index);
+                    let round_index = msg.metadata.round_index.unwrap_or(rounds.len());
+                    let round_id = msg
+                        .metadata
+                        .round_id
+                        .clone()
+                        .unwrap_or_else(|| format!("{}-round-{}", turn_id, round_index));
 
                     let mut text_items = Vec::new();
                     let mut thinking_items = Vec::new();
@@ -4966,8 +5041,8 @@ impl SessionManager {
                             end_time: Some(timestamp),
                             duration_ms: Some(0),
                             provider_id: None,
-                            model_id: None,
-                            model_alias: None,
+                            model_id: msg.metadata.model_id.clone(),
+                            model_alias: msg.metadata.model_id.clone(),
                             first_chunk_ms: None,
                             first_visible_output_ms: None,
                             stream_duration_ms: None,

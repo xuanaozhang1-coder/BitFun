@@ -32,7 +32,8 @@ use crate::agentic::image_analysis::ImageContextData;
 use crate::agentic::memories::{start_memory_startup_task, MemoryStartupRequest};
 use crate::agentic::round_preempt::DialogRoundInjectionSource;
 use crate::agentic::round_replay::{
-    restore_workspace_snapshot, RoundReplayCheckpoint, ROUND_REPLAY_METADATA_KEY,
+    normalize_routed_model_history, restore_workspace_snapshot, RoundReplayCheckpoint,
+    ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY, ROUND_REPLAY_METADATA_KEY,
     ROUND_REPLAY_START_CONTEXT_KEY,
 };
 use crate::agentic::session::session_store_port::CoreSessionStorePort;
@@ -2397,14 +2398,32 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                     "Round replay requires workspace services for the target session".to_string(),
                 )
             })?;
+        let artifact_session_id = checkpoint
+            .artifact_session_id
+            .as_deref()
+            .unwrap_or(&checkpoint.source_session_id);
+        self.session_manager
+            .restore_round_replay_session_artifacts(
+                &session_id,
+                artifact_session_id,
+                &checkpoint.session_artifacts,
+            )
+            .await?;
         restore_workspace_snapshot(
             &workspace.root_path_string(),
             &workspace_services,
             &checkpoint.workspace,
         )
         .await?;
+        if let Some(max_context_tokens) = checkpoint.session_max_context_tokens {
+            self.session_manager
+                .set_session_max_context_tokens(&session_id, max_context_tokens)
+                .await?;
+        }
+        let mut replay_messages = checkpoint.messages.clone();
+        normalize_routed_model_history(&mut replay_messages, &route.model_id);
         self.session_manager
-            .replace_context_messages(&session_id, checkpoint.messages.clone())
+            .replace_context_messages(&session_id, replay_messages)
             .await;
 
         let metadata = serde_json::json!({
@@ -2413,6 +2432,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 "source_turn_id": checkpoint.source_turn_id.clone(),
                 "source_turn_index": checkpoint.source_turn_index,
                 "round_index": checkpoint.round_index,
+                "artifact_session_id": artifact_session_id,
             },
             ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY: route,
             USER_INPUT_AVAILABLE_CONTEXT_KEY: false,
@@ -3448,6 +3468,16 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
                 })
             })
             .transpose()?;
+        let round_replay_artifact_session_id = user_message_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(ROUND_REPLAY_METADATA_KEY))
+            .and_then(|metadata| {
+                metadata
+                    .get("artifact_session_id")
+                    .or_else(|| metadata.get("source_session_id"))
+            })
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
         // Build image metadata for workspace turn persistence (before image_contexts is consumed)
         // Also stores original_text so the UI can display the user's actual input
@@ -3736,6 +3766,12 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             context_vars.insert(
                 ROUND_REPLAY_START_CONTEXT_KEY.to_string(),
                 round_index.to_string(),
+            );
+        }
+        if let Some(source_session_id) = round_replay_artifact_session_id {
+            context_vars.insert(
+                ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY.to_string(),
+                source_session_id,
             );
         }
         let review_agent = is_review_agent_type(&effective_agent_type);
