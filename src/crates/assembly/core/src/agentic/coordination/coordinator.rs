@@ -12,8 +12,9 @@ use super::{
 use crate::agentic::agents::get_agent_registry;
 use crate::agentic::context_profile::ContextProfilePolicy;
 use crate::agentic::core::{
-    InternalReminderKind, Message, MessageContent, MessageSemanticKind, ProcessingPhase, Session,
-    SessionConfig, SessionKind, SessionState, SessionSummary, TurnStats,
+    InternalReminderKind, Message, MessageContent, MessageSemanticKind,
+    ProcessingPhase, Session, SessionConfig, SessionKind, SessionState, SessionSummary,
+    TurnStats,
 };
 use crate::agentic::events::{
     AgenticEvent, DeepReviewQueueState, EventPriority, EventQueue, EventRouter, EventSubscriber,
@@ -2373,9 +2374,9 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         submission_policy: DialogSubmissionPolicy,
     ) -> BitFunResult<()> {
         checkpoint.validate()?;
-        if route.round_number != checkpoint.round_index {
+        if route.round_number != checkpoint.round_index + 1 {
             return Err(BitFunError::Validation(format!(
-                "Round replay checkpoint targets round {}, but the one-shot route targets round {}",
+                "Round replay checkpoint targets round {}, but the one-shot route targets round {} (expected checkpoint before target round)",
                 checkpoint.round_index, route.round_number
             )));
         }

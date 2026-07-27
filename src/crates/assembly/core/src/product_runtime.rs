@@ -274,9 +274,9 @@ impl CoreAgentRuntimeCompatibility {
         skip_tool_confirmation: bool,
     ) -> BitFunResult<()> {
         let checkpoint = RoundReplayCheckpoint::load(checkpoint_path).await?;
-        if route.round_number != checkpoint.round_index {
+        if route.round_number != checkpoint.round_index + 1 {
             return Err(BitFunError::Validation(format!(
-                "Checkpoint round {} does not match requested small-model round {}",
+                "Checkpoint round {} does not match requested small-model round {} (expected checkpoint before target round)",
                 checkpoint.round_index, route.round_number
             )));
         }
