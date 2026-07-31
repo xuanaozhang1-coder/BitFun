@@ -5,7 +5,7 @@ use bitfun_runtime_ports::WorkspaceServices;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-pub const ROUND_REPLAY_CHECKPOINT_VERSION: u32 = 2;
+pub const ROUND_REPLAY_CHECKPOINT_VERSION: u32 = 3;
 pub const ROUND_REPLAY_START_CONTEXT_KEY: &str = "eval_round_replay_start";
 pub const ROUND_REPLAY_ARTIFACT_SESSION_CONTEXT_KEY: &str = "eval_round_replay_artifact_session_id";
 pub const ROUND_REPLAY_METADATA_KEY: &str = "bitfun_eval_round_replay";
@@ -34,6 +34,9 @@ pub struct RoundReplayCheckpoint {
     pub workspace: RoundWorkspaceSnapshot,
     #[serde(default)]
     pub session_artifacts: Vec<RoundSessionArtifact>,
+    /// Logical workspace paths that passed an explicit Read before this round.
+    #[serde(default)]
+    pub file_read_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +117,33 @@ impl RoundReplayCheckpoint {
             validate_session_artifact_path(&artifact.relative_path)?;
         }
         Ok(())
+    }
+
+    /// Return explicit Read paths from both the v3 snapshot and legacy model-visible results.
+    pub fn replay_file_read_paths(&self) -> Vec<String> {
+        let mut paths = self.file_read_paths.clone();
+        paths.extend(self.messages.iter().filter_map(|message| {
+            let MessageContent::ToolResult {
+                tool_name,
+                effective_tool_name,
+                result,
+                is_error,
+                ..
+            } = &message.content
+            else {
+                return None;
+            };
+            if *is_error || effective_tool_name.as_deref().unwrap_or(tool_name.as_str()) != "Read" {
+                return None;
+            }
+            result
+                .get("file_path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }));
+        paths.sort();
+        paths.dedup();
+        paths
     }
 }
 
@@ -510,6 +540,7 @@ mod tests {
                 untracked_files: Vec::new(),
             },
             session_artifacts: Vec::new(),
+            file_read_paths: Vec::new(),
         };
         assert!(checkpoint.validate().is_err());
     }
@@ -536,10 +567,63 @@ mod tests {
             serde_json::from_value(value).expect("v1 checkpoint should deserialize");
         assert_eq!(checkpoint.version, 1);
         assert!(checkpoint.session_artifacts.is_empty());
+        assert!(checkpoint.file_read_paths.is_empty());
         assert_eq!(checkpoint.session_max_context_tokens, None);
         checkpoint
             .validate()
             .expect("v1 checkpoint should validate");
+    }
+
+    #[test]
+    fn legacy_checkpoint_recovers_only_successful_read_paths() {
+        let mut checkpoint: RoundReplayCheckpoint = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "sourceSessionId": "session",
+            "sourceTurnId": "turn",
+            "sourceTurnIndex": 0,
+            "roundIndex": 2,
+            "agentType": "agentic",
+            "originalUserInput": "task",
+            "primaryModelId": "large",
+            "messages": [Message::user("task".to_string())],
+            "workspace": {
+                "baselineCommit": "0123456789abcdef",
+                "trackedPatch": "",
+                "untrackedFiles": []
+            }
+        }))
+        .expect("legacy checkpoint should deserialize");
+        checkpoint.messages.extend([
+            Message::tool_result(crate::agentic::core::ToolResult {
+                tool_id: "read-ok".to_string(),
+                tool_name: "Read".to_string(),
+                effective_tool_name: None,
+                result: serde_json::json!({"file_path": "/workspace/src/lib.rs"}),
+                result_for_assistant: None,
+                is_error: false,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+            Message::tool_result(crate::agentic::core::ToolResult {
+                tool_id: "read-error".to_string(),
+                tool_name: "Read".to_string(),
+                effective_tool_name: None,
+                result: serde_json::json!({"file_path": "/workspace/secret.rs"}),
+                result_for_assistant: None,
+                is_error: true,
+                duration_ms: None,
+                image_attachments: None,
+            }),
+        ]);
+        checkpoint.file_read_paths = vec!["/workspace/older.rs".to_string()];
+
+        assert_eq!(
+            checkpoint.replay_file_read_paths(),
+            vec![
+                "/workspace/older.rs".to_string(),
+                "/workspace/src/lib.rs".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

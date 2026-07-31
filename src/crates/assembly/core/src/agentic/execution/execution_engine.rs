@@ -3185,6 +3185,9 @@ impl ExecutionEngine {
                     messages: messages.clone(),
                     workspace: workspace_snapshot,
                     session_artifacts,
+                    file_read_paths: self
+                        .session_manager
+                        .explicitly_read_file_paths(&context.session_id),
                 };
                 let checkpoint_path = self
                     .session_manager

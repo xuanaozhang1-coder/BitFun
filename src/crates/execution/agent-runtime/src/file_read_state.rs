@@ -242,6 +242,19 @@ impl FileReadStateStore {
             .get(session_id)
             .and_then(|states| states.get(logical_path).map(|entry| entry.clone()))
     }
+
+    pub fn explicitly_read_paths(&self, session_id: &str) -> Vec<String> {
+        let Some(states) = self.session_states.get(session_id) else {
+            return Vec::new();
+        };
+        let mut paths = states
+            .iter()
+            .filter(|entry| !entry.value().is_partial_view)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +317,19 @@ mod tests {
         assert!(store.get("session-a", "src/lib.rs").is_some());
         assert!(store.get("session-b", "src/lib.rs").is_none());
         assert!(store.get("session-a", "src/main.rs").is_none());
+    }
+
+    #[test]
+    fn file_read_state_store_lists_only_explicit_reads() {
+        let store = FileReadStateStore::new();
+        store.set("session", "src/z.rs", sample_state(1, 1, 1, false));
+        store.set("session", "src/a.rs", sample_state(1, 1, 1, false));
+        store.set("session", "src/injected.rs", sample_state(1, 1, 1, true));
+
+        assert_eq!(
+            store.explicitly_read_paths("session"),
+            vec!["src/a.rs".to_string(), "src/z.rs".to_string()]
+        );
     }
 
     #[test]

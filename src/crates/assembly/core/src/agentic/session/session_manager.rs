@@ -5610,6 +5610,10 @@ impl SessionManager {
         self.file_read_state_store.get(session_id, logical_path)
     }
 
+    pub fn explicitly_read_file_paths(&self, session_id: &str) -> Vec<String> {
+        self.file_read_state_store.explicitly_read_paths(session_id)
+    }
+
     /// Get dialog turn count
     pub fn get_turn_count(&self, session_id: &str) -> usize {
         self.sessions

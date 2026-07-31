@@ -12,9 +12,8 @@ use super::{
 use crate::agentic::agents::get_agent_registry;
 use crate::agentic::context_profile::ContextProfilePolicy;
 use crate::agentic::core::{
-    InternalReminderKind, Message, MessageContent, MessageSemanticKind,
-    ProcessingPhase, Session, SessionConfig, SessionKind, SessionState, SessionSummary,
-    TurnStats,
+    InternalReminderKind, Message, MessageContent, MessageSemanticKind, ProcessingPhase, Session,
+    SessionConfig, SessionKind, SessionState, SessionSummary, TurnStats,
 };
 use crate::agentic::events::{
     AgenticEvent, DeepReviewQueueState, EventPriority, EventQueue, EventRouter, EventSubscriber,
@@ -38,6 +37,7 @@ use crate::agentic::round_replay::{
     ROUND_REPLAY_START_CONTEXT_KEY,
 };
 use crate::agentic::session::session_store_port::CoreSessionStorePort;
+use crate::agentic::session::FileReadState;
 use crate::agentic::session::SessionManager;
 use crate::agentic::side_question::build_btw_user_input;
 use crate::agentic::skill_agent_snapshot::{
@@ -73,6 +73,7 @@ use bitfun_agent_runtime::round_model_route::{
     OneShotRoundModelRoute, ONE_SHOT_ROUND_MODEL_ROUTE_METADATA_KEY,
 };
 use bitfun_agent_runtime::user_questions::USER_INPUT_AVAILABLE_CONTEXT_KEY;
+use bitfun_agent_tools::resolve_workspace_tool_path;
 use bitfun_runtime_ports::{
     AgentBackgroundResultRequest, AgentSessionWorkspaceBinding, AgentThreadGoalDeliveryKind,
     AgentThreadGoalDeliveryRequest, DelegationPolicy, RemoteExecPort, SessionStoragePathRequest,
@@ -2374,7 +2375,7 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         submission_policy: DialogSubmissionPolicy,
     ) -> BitFunResult<()> {
         checkpoint.validate()?;
-        if route.round_number != checkpoint.round_index + 1 {
+        if route.round_number != checkpoint.round_index {
             return Err(BitFunError::Validation(format!(
                 "Round replay checkpoint targets round {}, but the one-shot route targets round {} (expected checkpoint before target round)",
                 checkpoint.round_index, route.round_number
@@ -2426,6 +2427,13 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
         self.session_manager
             .replace_context_messages(&session_id, replay_messages)
             .await;
+        self.restore_round_replay_file_read_states(
+            &session_id,
+            &workspace,
+            &workspace_services,
+            &checkpoint.replay_file_read_paths(),
+        )
+        .await;
 
         let metadata = serde_json::json!({
             ROUND_REPLAY_METADATA_KEY: {
@@ -2454,6 +2462,52 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             true,
         )
         .await
+    }
+
+    async fn restore_round_replay_file_read_states(
+        &self,
+        session_id: &str,
+        workspace: &WorkspaceBinding,
+        workspace_services: &WorkspaceServices,
+        logical_paths: &[String],
+    ) {
+        let workspace_root = workspace.root_path_string();
+        for logical_path in logical_paths {
+            let Ok(resolved_path) = resolve_workspace_tool_path(
+                logical_path,
+                Some(&workspace_root),
+                workspace.is_remote(),
+            ) else {
+                continue;
+            };
+            if !std::path::Path::new(&resolved_path).starts_with(workspace.root_path()) {
+                continue;
+            }
+            let Ok(bytes) = workspace_services.fs.read_file(&resolved_path).await else {
+                continue;
+            };
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let timestamp_ms = if workspace.is_remote() {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0)
+            } else {
+                std::fs::metadata(&resolved_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0)
+            };
+            self.session_manager.set_file_read_state(
+                session_id,
+                &resolved_path,
+                FileReadState::from_full_content(&content, timestamp_ms),
+            );
+        }
     }
 
     fn thread_goal_store(&self) -> ThreadGoalStore<'_> {
