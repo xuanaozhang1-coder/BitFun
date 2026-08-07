@@ -800,7 +800,7 @@ pub async fn create_session(
     let config = request
         .config
         .map(|c| SessionConfig {
-            max_context_tokens: c.max_context_tokens.unwrap_or(128128),
+            max_context_tokens: c.max_context_tokens.unwrap_or(1_048_576),
             auto_compact: c.auto_compact.unwrap_or(true),
             enable_tools: c.enable_tools.unwrap_or(true),
             safe_mode: c.safe_mode.unwrap_or(true),

@@ -5309,8 +5309,8 @@ Update the persona files and delete BOOTSTRAP.md as soon as bootstrap is complet
             }
         };
         let session_id = session.session_id.clone();
-        // Sync context window from AI config so subagents with large-context
-        // models are not prematurely capped at SessionConfig::default()'s 128128.
+        // Sync context window from AI config so subagents follow the selected
+        // model's configured capability instead of a generic session default.
         if let Err(error) = self
             .session_manager
             .refresh_session_context_window(&session_id)

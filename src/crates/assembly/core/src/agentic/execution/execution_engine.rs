@@ -3181,7 +3181,11 @@ impl ExecutionEngine {
                     agent_type: agent_type.clone(),
                     original_user_input: original_user_input.clone(),
                     primary_model_id: model_id.clone(),
-                    session_max_context_tokens: Some(session_max_tokens),
+                    // Persist the context limit that was actually effective for
+                    // this turn. The model and session limits may differ, and
+                    // replay must restore the smaller one that governed the
+                    // source request rather than the raw session preference.
+                    session_max_context_tokens: Some(context_window),
                     messages: messages.clone(),
                     workspace: workspace_snapshot,
                     session_artifacts,

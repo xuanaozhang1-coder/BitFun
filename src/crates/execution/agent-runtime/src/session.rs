@@ -165,7 +165,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            max_context_tokens: 128128,
+            max_context_tokens: 1_048_576,
             auto_compact: true,
             enable_tools: true,
             safe_mode: true,
@@ -247,10 +247,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn session_config_default_preserves_existing_context_budget() {
+    fn session_config_default_uses_current_context_budget() {
         let config = SessionConfig::default();
 
-        assert_eq!(config.max_context_tokens, 128128);
+        assert_eq!(config.max_context_tokens, 1_048_576);
         assert!(config.auto_compact);
         assert!(config.enable_tools);
         assert!(config.safe_mode);
@@ -326,7 +326,7 @@ mod tests {
             json!({
                 "schema_version": 1,
                 "config": {
-                    "max_context_tokens": 128128,
+                    "max_context_tokens": 1048576,
                     "auto_compact": true,
                     "enable_tools": true,
                     "safe_mode": true,
